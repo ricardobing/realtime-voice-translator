@@ -36,6 +36,8 @@ from google import genai
 from google.genai import types
 from pynput import keyboard
 
+from devices import ROLES, resolve_by_role, validate_samplerate
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -51,14 +53,6 @@ INPUT_CHUNK_BYTES = INPUT_CHUNK_SAMPLES * 2
 HEALTH_CHECK_INTERVAL = 5.0         # seconds between health checks
 HEALTH_CHECK_TIMEOUT = 15.0         # seconds without audio triggers reconnect
 RECONNECT_MAX_DELAY = 30.0          # max backoff delay in seconds
-
-# Device name substrings (case-insensitive).
-# Run: python main.py --list-devices   to see your exact device names.
-# Adjust these to match what appears on YOUR system.
-MIC_DEVICE_NAME = "USB PnP"              # physical microphone (capture Spanish)
-VBCABLE_DEVICE_NAME = "CABLE Input"      # VB-Cable playback side (inject English here)
-LOOPBACK_DEVICE_NAME = "Voicemeeter Out B1"  # VoiceMeeter B1 virtual output (capture system audio)
-HEADPHONES_DEVICE_NAME = "Realtek"       # physical headphones / speakers (hear translation)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -199,62 +193,38 @@ def start_hotkey_listener(sm: StateMachine) -> keyboard.Listener:
 # ---------------------------------------------------------------------------
 
 class AudioDeviceManager:
-    """Discovers and selects audio devices by name substring (case-insensitive)."""
-
-    @staticmethod
-    def _find_device(name_hint: str, want_input: bool, want_output: bool) -> int:
-        devices = sd.query_devices()
-        real_matches = []
-        mapper_matches = []
-        hint_lower = name_hint.lower()
-        mapper_keywords = ("asignador", "mapper", "primary sound")
-
-        for i, d in enumerate(devices):
-            name_lower = d["name"].lower()
-            if hint_lower not in name_lower:
-                continue
-            if want_input and d["max_input_channels"] == 0:
-                continue
-            if want_output and d["max_output_channels"] == 0:
-                continue
-            is_mapper = any(kw in name_lower for kw in mapper_keywords)
-            if is_mapper:
-                mapper_matches.append((i, d))
-            else:
-                real_matches.append((i, d))
-
-        preferred = real_matches or mapper_matches
-        if not preferred:
-            log.error("No %s device matching '%s' found.",
-                      "input" if want_input else "output", name_hint)
-            log.error("Run --list-devices to see available devices.")
-            raise SystemExit(1)
-
-        idx, dev = preferred[0]
-        log.info("Selected device [%d] %s (in=%d, out=%d, rate=%.0f)",
-                 idx, dev["name"], dev["max_input_channels"],
-                 dev["max_output_channels"], dev["default_samplerate"])
-        return idx
-
-    @staticmethod
-    def find_input(name_hint: str) -> int:
-        return AudioDeviceManager._find_device(name_hint, want_input=True, want_output=False)
-
-    @staticmethod
-    def find_output(name_hint: str) -> int:
-        return AudioDeviceManager._find_device(name_hint, want_input=False, want_output=True)
+    """Thin wrapper — delegates to src/devices.py for device listing."""
 
     @staticmethod
     def list_all() -> None:
-        devices = sd.query_devices()
-        host_apis = {i: sd.query_hostapis(i)["name"] for i in range(sd.query_hostapis().__len__())}
+        from devices import list_all_devices
+        ds = list_all_devices()
         print("\n=== AVAILABLE AUDIO DEVICES ===\n")
-        print(f"{'Idx':>3s}  {'Host API':<15s} {'Name':<55s} {'In':>4s} {'Out':>4s} {'Rate':>8s}")
-        print("-" * 95)
-        for i, d in enumerate(devices):
-            ha_name = host_apis.get(d["hostapi"], "?")
-            print(f"{i:3d}  {ha_name:<15s} {d['name']:<55s} {d['max_input_channels']:4d} {d['max_output_channels']:4d} {d['default_samplerate']:8.0f}")
+        print(f"{'Idx':>3s}  {'Host API':<20s} {'Name':<55s} {'In':>4s} {'Out':>4s} {'Rate':>8s}")
+        print("-" * 100)
+        for d in ds:
+            print(f"{d['index']:3d}  {d['host_api']:<20s} {d['name']:<55s} {d['max_input_channels']:4d} {d['max_output_channels']:4d} {d['default_samplerate']:8.0f}")
         print()
+
+# ---------------------------------------------------------------------------
+# Device recovery helper
+# ---------------------------------------------------------------------------
+
+def _recover_device(role_name: str, kind: str, desired_sr: int,
+                    channels: int, blocksize: int | None) -> tuple:
+    """Re-resolve a device role and validate sample rate after disconnect."""
+    from devices import ROLES as DEV_ROLES, resolve_by_fingerprint, resolve_by_role, validate_samplerate, ResolvedDevice
+    from config import load_fingerprints, save_fingerprint
+    fps = load_fingerprints()
+    rd = None
+    if fps.get(role_name):
+        rd = resolve_by_fingerprint(fps[role_name])
+    if rd is None:
+        rd = resolve_by_role(DEV_ROLES[role_name])
+        save_fingerprint(role_name, rd.fingerprint)
+    actual_sr = validate_samplerate(rd.index, desired_sr, channels, kind)
+    return rd, actual_sr
+
 
 # ---------------------------------------------------------------------------
 # Audio capture — microphone or loopback
@@ -275,6 +245,8 @@ class AudioCapture:
         name: str = "",
         pause_event: asyncio.Event | None = None,
         on_volume: "callable | None" = None,
+        role_name: str = "",
+        on_status: "callable | None" = None,
     ):
         self.device_index = device_index
         self.sample_rate = sample_rate
@@ -286,8 +258,19 @@ class AudioCapture:
         self._pause_event = pause_event or asyncio.Event()
         self._pause_event.set()  # running by default
         self._on_volume = on_volume  # (db: float) -> None
+        self._role_name = role_name
+        self._on_status = on_status  # (status: str) -> None
+        self.MAX_LOCAL_RETRIES = 3
 
     async def start(self) -> None:
+        # Validate sample rate; input at wrong rate breaks Gemini
+        actual_sr = validate_samplerate(self.device_index, self.sample_rate,
+                                        CHANNELS, "input")
+        if actual_sr != self.sample_rate:
+            raise RuntimeError(
+                f"[Capture:{self.name}] Device {self.device_index} does not support "
+                f"{self.sample_rate} Hz input (gemini requires exactly {INPUT_SAMPLE_RATE} Hz)"
+            )
         self._stream = sd.InputStream(
             device=self.device_index,
             samplerate=self.sample_rate,
@@ -302,12 +285,43 @@ class AudioCapture:
 
     async def run(self) -> None:
         """Continuously read chunks into the queue.  Call after start()."""
+        reconnect_attempts = 0
+        backoff = 1.0
         try:
             while self._running:
                 await self._pause_event.wait()  # block while PAUSED
-                data_np, overflowed = await asyncio.to_thread(
-                    self._stream.read, self.chunk_samples
-                )
+                try:
+                    data_np, overflowed = await asyncio.to_thread(
+                        self._stream.read, self.chunk_samples
+                    )
+                    reconnect_attempts = 0
+                    backoff = 1.0
+                except sd.PortAudioError as e:
+                    log.warning("[Capture:%s] Input device error: %s", self.name, e)
+                    try: self._stream.stop(); self._stream.close()
+                    except Exception: pass
+                    if reconnect_attempts >= self.MAX_LOCAL_RETRIES:
+                        log.error("[Capture:%s] Irrecuperable tras %d intentos", self.name, reconnect_attempts)
+                        if self._on_status: self._on_status("FAILED")
+                        raise
+                    if self._on_status: self._on_status("RECONNECTING")
+                    await asyncio.sleep(backoff)
+                    try:
+                        rd, actual_sr = _recover_device(self._role_name, "input",
+                                                        self.sample_rate, CHANNELS, self.chunk_samples)
+                        self._stream = sd.InputStream(
+                            device=rd.index, samplerate=actual_sr, channels=CHANNELS,
+                            dtype=DTYPE, blocksize=self.chunk_samples)
+                        self._stream.start()
+                        self.device_index = rd.index; self.sample_rate = actual_sr
+                        log.info("[Capture:%s] Recovered -> [%d] %s @ %d Hz", self.name, rd.index, rd.name, actual_sr)
+                        reconnect_attempts += 1; backoff *= 2
+                        if self._on_status: self._on_status("RUNNING")
+                        continue
+                    except Exception as reopen_err:
+                        log.error("[Capture:%s] Reopen failed: %s", self.name, reopen_err)
+                        reconnect_attempts += 1; backoff *= 2
+                        continue
                 if overflowed:
                     log.warning("[Capture:%s] Input overflow", self.name)
 
@@ -368,6 +382,9 @@ class AudioPlayer:
         device_index: int,
         sample_rate: int = OUTPUT_SAMPLE_RATE,
         name: str = "",
+        resample_fn: "callable[[bytes], bytes] | None" = None,
+        role_name: str = "",
+        on_status: "callable | None" = None,
     ):
         self.device_index = device_index
         self.sample_rate = sample_rate
@@ -375,8 +392,18 @@ class AudioPlayer:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         self._stream: sd.OutputStream | None = None
         self._running = False
+        self._resample_fn = resample_fn
+        self._role_name = role_name
+        self._on_status = on_status
+        self.MAX_LOCAL_RETRIES = 3
 
     async def start(self) -> None:
+        actual_sr = validate_samplerate(self.device_index, self.sample_rate,
+                                        CHANNELS, "output")
+        if actual_sr != self.sample_rate:
+            log.warning("[Player:%s] Using fallback rate %d Hz (requested %d Hz)",
+                        self.name, actual_sr, self.sample_rate)
+            self.sample_rate = actual_sr
         self._stream = sd.OutputStream(
             device=self.device_index,
             samplerate=self.sample_rate,
@@ -390,11 +417,41 @@ class AudioPlayer:
 
     async def run(self) -> None:
         """Continuously drain the queue and play audio."""
+        reconnect_attempts = 0
+        backoff = 1.0
         try:
             while self._running:
-                data_bytes = await self.queue.get()
-                data_np = np.frombuffer(data_bytes, dtype=np.int16).copy()
-                underflowed = await asyncio.to_thread(self._stream.write, data_np)
+                try:
+                    data_bytes = await self.queue.get()
+                    if self._resample_fn:
+                        data_bytes = self._resample_fn(data_bytes)
+                    data_np = np.frombuffer(data_bytes, dtype=np.int16).copy()
+                    underflowed = await asyncio.to_thread(self._stream.write, data_np)
+                    reconnect_attempts = 0
+                    backoff = 1.0
+                except sd.PortAudioError as e:
+                    log.warning("[Player:%s] Output device error: %s", self.name, e)
+                    try: self._stream.stop(); self._stream.close()
+                    except Exception: pass
+                    if reconnect_attempts >= self.MAX_LOCAL_RETRIES:
+                        log.error("[Player:%s] Irrecuperable tras %d intentos", self.name, reconnect_attempts)
+                        if self._on_status: self._on_status("FAILED")
+                        raise
+                    if self._on_status: self._on_status("RECONNECTING")
+                    await asyncio.sleep(backoff)
+                    try:
+                        rd, actual_sr = _recover_device(self._role_name, "output",
+                                                        self.sample_rate, CHANNELS, None)
+                        self._stream = sd.OutputStream(
+                            device=rd.index, samplerate=actual_sr, channels=CHANNELS, dtype=DTYPE)
+                        self._stream.start()
+                        self.device_index = rd.index; self.sample_rate = actual_sr
+                        log.info("[Player:%s] Recovered -> [%d] %s @ %d Hz", self.name, rd.index, rd.name, actual_sr)
+                        reconnect_attempts += 1; backoff *= 2
+                        if self._on_status: self._on_status("RUNNING")
+                    except Exception as reopen_err:
+                        log.error("[Player:%s] Reopen failed: %s", self.name, reopen_err)
+                        reconnect_attempts += 1; backoff *= 2
                 if underflowed:
                     log.debug("[Player:%s] Output underflow", self.name)
                 self.queue.task_done()
@@ -414,6 +471,23 @@ class AudioPlayer:
             except Exception:
                 pass
             self._stream = None
+
+
+# ---------------------------------------------------------------------------
+# Audio resampling helpers
+# ---------------------------------------------------------------------------
+
+def resample_24k_to_48k(data_bytes: bytes) -> bytes:
+    """Linear-interpolation upsampling from 24000 → 48000 Hz."""
+    samples = np.frombuffer(data_bytes, dtype=np.int16).astype(np.float64)
+    n = len(samples)
+    resampled = np.interp(
+        np.arange(0, n - 1, 0.5),
+        np.arange(n),
+        samples[:n]
+    ).astype(np.int16)
+    return resampled.tobytes()
+
 
 # ---------------------------------------------------------------------------
 # Gemini Live Translate session
@@ -437,12 +511,15 @@ class GeminiSession:
         label: str = "",
         pause_event: asyncio.Event | None = None,
         on_transcription: "callable | None" = None,
+        on_direction_status: "callable | None" = None,
     ):
         self.api_key = api_key
         self.target_language = target_language
         self.label = label or target_language
         self.client = genai.Client(api_key=api_key)
         self._on_transcription = on_transcription  # (role, text) -> None
+        self._on_direction_status = on_direction_status  # (status: str) -> None
+        self._max_retries = 10
 
         # Pause support
         self._pause_event = pause_event or asyncio.Event()
@@ -489,10 +566,16 @@ class GeminiSession:
         self._last_audio_sent = time.time()
         log.info("[%s] Connecting to Gemini Live (target=%s, model=%s)...",
                  self.label, self.target_language, MODEL)
+        if self._on_direction_status:
+            try: self._on_direction_status("CONNECTING")
+            except Exception: pass
 
         try:
             async with self.client.aio.live.connect(model=MODEL, config=config) as session:
                 log.info("[%s] Connected to Gemini Live", self.label)
+                if self._on_direction_status:
+                    try: self._on_direction_status("RUNNING")
+                    except Exception: pass
 
                 async def sender():
                     try:
@@ -609,6 +692,17 @@ class GeminiSession:
                 raise
             except Exception:
                 self.reconnect_count += 1
+                if self._on_direction_status:
+                    try:
+                        self._on_direction_status(
+                            "FAILED" if self.reconnect_count >= self._max_retries
+                            else "RECONNECTING"
+                        )
+                    except Exception: pass
+                if self.reconnect_count >= self._max_retries:
+                    log.error("[%s] Max retries (%d) reached — giving up",
+                              self.label, self._max_retries)
+                    raise
                 delay = min(2.0 ** self.reconnect_count, RECONNECT_MAX_DELAY)
                 log.warning("[%s] Reconnecting in %.1fs (attempt %d)...",
                             self.label, delay, self.reconnect_count)
@@ -729,9 +823,31 @@ async def run_engine(
         on_t_A, on_v_A   — transcription / volume for direction A
         on_t_B, on_v_B   — transcription / volume for direction B
 
-    Set *show_status_bar* = False when running under the UI.
+    Device indices are optional; if not provided, they are re-discovered
+    from config each time the pipeline starts (so UI config changes work).
+    Pass them explicitly in CLI mode for predictable behaviour.
     """
     cb = callbacks or {}
+
+    # ---------- preflight + device resolution ----------
+    from preflight import run_preflight
+    from config import load_fingerprints, save_fingerprint
+
+    fps = load_fingerprints()
+    pf = run_preflight(api_key, fps)
+    if not pf.ok:
+        for err in pf.errors:
+            log.error("Preflight: %s", err)
+        raise RuntimeError(f"Preflight failed: {pf.errors}")
+
+    resolved = pf.devices_resolved
+    for role_name, rd in resolved.items():
+        if rd is not None:
+            save_fingerprint(role_name, rd.fingerprint)
+
+    def _get_resolved(name: str) -> ResolvedDevice | None:
+        from devices import ResolvedDevice
+        return resolved.get(name)
 
     # ---------- helper: build a pipeline ----------
     def _build(
@@ -741,16 +857,35 @@ async def run_engine(
         player_idx: int,
         cap_name: str,
         plr_name: str,
+        cap_role: str,
+        plr_role: str,
         on_t: "callable | None" = None,
         on_v: "callable | None" = None,
+        player_rate: int = OUTPUT_SAMPLE_RATE,
+        player_resample: "callable[[bytes], bytes] | None" = None,
     ) -> TranslationPipeline:
+        # Map role → direction for status callbacks
+        dir_map = {"mic": "A", "virtual_mic_out": "A", "loopback_in": "B", "headphones_out": "B"}
+        on_ds = cb.get("on_ds")
+        cap_dir = dir_map.get(cap_role, "?")
+        plr_dir = dir_map.get(plr_role, "?")
+
+        def _cap_status(st): 
+            if on_ds: on_ds(cap_dir, st)
+        def _plr_status(st):
+            if on_ds: on_ds(plr_dir, st)
+
         pause_evt = asyncio.Event()
         pause_evt.set()
         cap = AudioCapture(capture_idx, INPUT_SAMPLE_RATE, INPUT_CHUNK_SAMPLES,
-                           name=cap_name, pause_event=pause_evt, on_volume=on_v)
+                           name=cap_name, pause_event=pause_evt, on_volume=on_v,
+                           role_name=cap_role, on_status=_cap_status)
         ses = GeminiSession(api_key=api_key, target_language=target_lang,
-                            label=tag, pause_event=pause_evt, on_transcription=on_t)
-        plr = AudioPlayer(player_idx, OUTPUT_SAMPLE_RATE, name=plr_name)
+                            label=tag, pause_event=pause_evt, on_transcription=on_t,
+                            on_direction_status=cb.get("on_ds"))
+        plr = AudioPlayer(player_idx, player_rate, name=plr_name,
+                           resample_fn=player_resample,
+                           role_name=plr_role, on_status=_plr_status)
         return TranslationPipeline(cap, ses, plr, tag, pause_evt, on_t, on_v)
 
     # ---------- hotkeys ----------
@@ -775,16 +910,38 @@ async def run_engine(
     # ---------- pipeline lifecycle ----------
     async def start_pipelines():
         nonlocal direction_start
-        if mic_idx is not None and vbcable_idx is not None:
-            p = _build("A(es->en)", mic_idx, "en", vbcable_idx, "Mic", "VB-Cable",
+        mic_rd = _get_resolved("mic")
+        vm_rd  = _get_resolved("virtual_mic_out")
+        lb_rd  = _get_resolved("loopback_in")
+        hp_rd  = _get_resolved("headphones_out")
+
+        # Validate sample rates
+        mic_sr = INPUT_SAMPLE_RATE
+        if mic_rd:
+            mic_sr = validate_samplerate(mic_rd.index, INPUT_SAMPLE_RATE, CHANNELS, "input")
+        hp_sr = 48000  # headphone target (we resample 24k->48k)
+        if hp_rd:
+            hp_sr = validate_samplerate(hp_rd.index, 48000, CHANNELS, "output")
+
+        if mic_rd is not None and vm_rd is not None:
+            p = _build("A(es->en)", mic_rd.index, "en", vm_rd.index, "Mic", "VB-Cable",
+                       cap_role="mic", plr_role="virtual_mic_out",
                        on_t=cb.get("on_t_A"), on_v=cb.get("on_v_A"))
             pipelines["A"] = p
-            log.info("Direction A ready: Mic[%d] -> Gemini(en) -> VB-Cable[%d]", mic_idx, vbcable_idx)
-        if loopback_idx is not None and headphones_idx is not None:
-            p = _build("B(en->es)", loopback_idx, "es", headphones_idx, "Loopback", "Phones",
-                       on_t=cb.get("on_t_B"), on_v=cb.get("on_v_B"))
+            log.info("Direction A ready: %s[%d] -> Gemini(en) -> %s[%d] @%d Hz",
+                     mic_rd.host_api, mic_rd.index, vm_rd.host_api, vm_rd.index, mic_sr)
+        if lb_rd is not None and hp_rd is not None:
+            need_resample = hp_sr != OUTPUT_SAMPLE_RATE
+            p = _build("B(en->es)", lb_rd.index, "es", hp_rd.index, "Loopback", "Phones",
+                       cap_role="loopback_in", plr_role="headphones_out",
+                       on_t=cb.get("on_t_B"), on_v=cb.get("on_v_B"),
+                       player_rate=hp_sr,
+                       player_resample=resample_24k_to_48k if need_resample else None)
             pipelines["B"] = p
-            log.info("Direction B ready: B1[%d] -> Gemini(es) -> Phones[%d]", loopback_idx, headphones_idx)
+            log.info("Direction B ready: %s[%d] -> Gemini(es) -> %s[%d] @%d Hz%s",
+                     lb_rd.host_api, lb_rd.index,
+                     hp_rd.host_api, hp_rd.index, hp_sr,
+                     " (resampled)" if need_resample else "")
 
         if not pipelines:
             log.error("No pipelines could be created.")
@@ -795,6 +952,16 @@ async def run_engine(
         log.info("Launching %d pipeline(s)...", len(pipelines))
         for key, p in pipelines.items():
             tasks[key] = asyncio.create_task(p.run(), name=f"pipeline-{key}")
+
+        # Heartbeat watchdog — pings the UI every 2s
+        async def _heartbeat():
+            hb = cb.get("on_heartbeat")
+            while True:
+                await asyncio.sleep(2.0)
+                if hb:
+                    try: hb()
+                    except Exception: pass
+        tasks["heartbeat"] = asyncio.create_task(_heartbeat(), name="heartbeat")
 
     async def stop_pipelines():
         log.info("Stopping pipelines...")
@@ -890,35 +1057,11 @@ async def async_main(args) -> None:
         AudioDeviceManager.list_all()
         return
 
-    # --- Device discovery ---
-    direction = args.direction
-    mic_idx = vbcable_idx = loopback_idx = headphones_idx = None
-
-    if direction in ("A", "both"):
-        try:
-            mic_idx = AudioDeviceManager.find_input(args.mic_device or MIC_DEVICE_NAME)
-            vbcable_idx = AudioDeviceManager.find_output(args.vbcable_device or VBCABLE_DEVICE_NAME)
-        except SystemExit:
-            log.error("Cannot start Direction A — required device not found")
-            if direction == "A":
-                sys.exit(1)
-
-    if direction in ("B", "both"):
-        try:
-            loopback_idx = AudioDeviceManager.find_input(args.loopback_device or LOOPBACK_DEVICE_NAME)
-            headphones_idx = AudioDeviceManager.find_output(args.headphones_device or HEADPHONES_DEVICE_NAME)
-        except SystemExit:
-            log.error("Cannot start Direction B — required device not found")
-            if direction == "B":
-                sys.exit(1)
-
     loop = asyncio.get_running_loop()
     sm = StateMachine(loop)
 
     await run_engine(
         sm=sm, api_key=api_key,
-        mic_idx=mic_idx, vbcable_idx=vbcable_idx,
-        loopback_idx=loopback_idx, headphones_idx=headphones_idx,
         show_status_bar=True,
     )
 

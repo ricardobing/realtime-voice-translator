@@ -2,6 +2,9 @@
 .env
 src/.env
 
+# User-specific config
+src/config.json
+
 # Log files
 logs/
 *.log
