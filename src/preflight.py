@@ -24,6 +24,11 @@ class PreflightResult:
     voicemeeter_running: bool
     devices_resolved: dict  # role_name -> ResolvedDevice | None
     errors: List[str] = field(default_factory=list)
+    # Windows audio defaults (warning, non-blocking)
+    windows_playback_ok: Optional[bool] = None
+    windows_recording_ok: Optional[bool] = None
+    windows_playback_name: Optional[str] = None
+    windows_recording_name: Optional[str] = None
 
 
 def check_api_key(api_key: str) -> tuple[bool, Optional[str]]:
@@ -114,4 +119,20 @@ def run_preflight(api_key: str, saved_fingerprints: dict) -> PreflightResult:
         and result.voicemeeter_running
         and all(v is not None for v in result.devices_resolved.values())
     )
+
+    # 5. Windows defaults (warning only — non-blocking)
+    try:
+        from windows_audio import get_windows_defaults
+        wd = get_windows_defaults()
+        result.windows_playback_ok = wd.playback_is_vaio
+        result.windows_recording_ok = wd.recording_is_b1
+        result.windows_playback_name = wd.playback_name
+        result.windows_recording_name = wd.recording_name
+        if not wd.playback_is_vaio and wd.playback_name:
+            log.warning("Preflight: Default Playback is '%s' (not VAIO)", wd.playback_name)
+        if not wd.recording_is_b1 and wd.recording_name:
+            log.warning("Preflight: Default Recording is '%s' (not B1)", wd.recording_name)
+    except Exception:
+        pass  # pycaw unavailable — fields stay at None
+
     return result

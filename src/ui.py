@@ -37,6 +37,7 @@ from main import (
 )
 from config import load_config, save_config, load_fingerprints, save_fingerprint
 from devices import ROLES, list_all_devices, resolve_by_role, resolve_by_fingerprint, validate_samplerate
+from windows_audio import get_windows_defaults, open_sound_settings_playback, open_sound_settings_recording
 
 # ---------------------------------------------------------------------------
 # Color palette
@@ -519,6 +520,20 @@ class TranslatorUI:
         apply_btn.pack(side=tk.RIGHT)
         apply_btn.bind("<Button-1>", lambda e: self._apply_devices())
         Tooltip(apply_btn, "Guarda los dispositivos y reinicia la traducci\u00f3n.")
+
+        # Quick Sound Settings shortcuts
+        ss_row = tk.Frame(self.devices_frame, bg=SURFACE)
+        ss_row.pack(fill=tk.X, padx=8, pady=(0, 2))
+        tiny = tkfont.Font(family="Segoe UI", size=7)
+        tk.Label(ss_row, text="\u2699", fg=MUTED, bg=SURFACE, font=tiny).pack(side=tk.LEFT)
+        pb_btn = tk.Label(ss_row, text="Sound Reproducci\u00f3n", fg=MUTED, bg=SURFACE,
+                          font=tiny, cursor="hand2")
+        pb_btn.pack(side=tk.LEFT, padx=(2, 6))
+        pb_btn.bind("<Button-1>", lambda e: open_sound_settings_playback())
+        rec_btn = tk.Label(ss_row, text="Sound Grabaci\u00f3n", fg=MUTED, bg=SURFACE,
+                           font=tiny, cursor="hand2")
+        rec_btn.pack(side=tk.LEFT, padx=2)
+        rec_btn.bind("<Button-1>", lambda e: open_sound_settings_recording())
         self._build_help_panel()
 
     def _init_combo_role(self, role_name, combo, kind, status_lbl):
@@ -670,14 +685,16 @@ class TranslatorUI:
         modal._result = False
 
         f = tkfont.Font(family="Consolas", size=9)
-        check_vars = {"api": False, "vm": False, "devices": False, "audio": False}
+        check_vars = {"api": False, "vm": False, "devices": False, "audio": False,
+                      "playback": True, "recording": True}  # warnings, not blockers
         check_labels = {}
 
         tk.Label(modal, text="Verificaci\u00f3n previa", bg=SURFACE, fg=TEXT,
                  font=tkfont.Font(family="Segoe UI", size=12, weight="bold")).pack(pady=(10, 6))
 
         for key, label in [("api", "API Key Gemini"), ("vm", "Voicemeeter Banana"),
-                            ("devices", "Dispositivos de audio"), ("audio", "Test de audio")]:
+                            ("devices", "Dispositivos de audio"), ("audio", "Test de audio"),
+                            ("playback", "Default Playback (VAIO)"), ("recording", "Default Recording (B1)")]:
             row = tk.Frame(modal, bg=SURFACE)
             row.pack(fill=tk.X, padx=20, pady=2)
             icon = tk.Label(row, text="\u23f3", bg=SURFACE, fg=MUTED, font=f)
@@ -722,6 +739,25 @@ class TranslatorUI:
                 modal.after(0, lambda: _set_check("devices", True))
             except Exception as e:
                 modal.after(0, lambda: _set_check("devices", False, str(e)[:200]))
+
+            # 3b. Windows audio defaults (warning, non-blocking)
+            try:
+                wd = get_windows_defaults()
+                if wd.playback_is_vaio:
+                    modal.after(0, lambda: _set_check("playback", True))
+                else:
+                    pb_info = wd.playback_name or "No detectado"
+                    modal.after(0, lambda: _set_check("playback", False,
+                        "Es: {}. Deberia ser VoiceMeeter Input (VAIO).".format(pb_info)))
+                if wd.recording_is_b1:
+                    modal.after(0, lambda: _set_check("recording", True))
+                else:
+                    rec_info = wd.recording_name or "No detectado"
+                    modal.after(0, lambda: _set_check("recording", False,
+                        "Es: {}. Deberia ser VoiceMeeter Out B1.".format(rec_info)))
+            except Exception:
+                modal.after(0, lambda: _set_check("playback", False, "No se pudo verificar (pycaw no disponible)"))
+                modal.after(0, lambda: _set_check("recording", False, "No se pudo verificar (pycaw no disponible)"))
 
             # 4. Audio test
             def _audio_test():
@@ -809,7 +845,23 @@ class TranslatorUI:
         run_btn.pack(side=tk.BOTTOM, pady=(6, 0))
         run_btn.bind("<Button-1>", lambda e: threading.Thread(target=_run_checks, daemon=True).start())
 
-        # Also add a cancel button
+        # Sound settings shortcuts
+        ss_row = tk.Frame(modal, bg=SURFACE)
+        ss_row.pack(side=tk.BOTTOM, pady=(2, 0))
+        tk.Label(ss_row, text="Sound Settings:", bg=SURFACE, fg=MUTED,
+                 font=tkfont.Font(family="Segoe UI", size=8)).pack(side=tk.LEFT, padx=(10, 4))
+        tk.Label(ss_row, text="Reprod", fg=ACCENT, bg=SURFACE, cursor="hand2",
+                 font=tkfont.Font(family="Segoe UI", size=8)).pack(side=tk.LEFT, padx=2)
+        tk.Label(ss_row, text="|", bg=SURFACE, fg=MUTED,
+                 font=tkfont.Font(family="Segoe UI", size=8)).pack(side=tk.LEFT)
+        tk.Label(ss_row, text="Grabac", fg=ACCENT, bg=SURFACE, cursor="hand2",
+                 font=tkfont.Font(family="Segoe UI", size=8)).pack(side=tk.LEFT, padx=2)
+        # Bind actions
+        for child in ss_row.winfo_children():
+            if isinstance(child, tk.Label) and child.cget("text") == "Reprod":
+                child.bind("<Button-1>", lambda e: open_sound_settings_playback())
+            elif isinstance(child, tk.Label) and child.cget("text") == "Grabac":
+                child.bind("<Button-1>", lambda e: open_sound_settings_recording())
         cancel_btn = tk.Label(modal, text="Cancelar", fg=MUTED, bg=SURFACE,
                               font=tkfont.Font(family="Segoe UI", size=10), cursor="hand2",
                               padx=14, pady=4)
