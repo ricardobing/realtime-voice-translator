@@ -36,6 +36,8 @@ from google import genai
 from google.genai import types
 from pynput import keyboard
 
+import webrtcvad
+
 from devices import ROLES, resolve_by_role, validate_samplerate
 
 # ---------------------------------------------------------------------------
@@ -207,23 +209,115 @@ class AudioDeviceManager:
         print()
 
 # ---------------------------------------------------------------------------
+# Voice Activity Detection (VAD) + Smart Muting
+# ---------------------------------------------------------------------------
+
+class VoiceActivityDetector:
+    """
+    Detects voice activity in 16kHz 16-bit mono PCM chunks.
+    Uses webrtcvad internally with hysteresis smoothing.
+    """
+
+    FRAME_MS = 30
+    FRAME_SAMPLES = 480       # 30ms @ 16kHz
+    FRAME_BYTES = 960         # 480 samples * 2 bytes
+
+    def __init__(self, aggressiveness: int = 2,
+                 speech_frames_threshold: int = 3,
+                 silence_frames_threshold: int = 10):
+        self._vad = webrtcvad.Vad(aggressiveness)
+        self._speech_threshold = speech_frames_threshold
+        self._silence_threshold = silence_frames_threshold
+        self._buffer = b""
+        self._speech_frames = 0
+        self._silence_frames = 0
+        self.is_speech_active = False
+
+    def process_chunk(self, audio_bytes: bytes) -> bool:
+        """
+        Feed a chunk of audio. Accumulates until a complete 30ms frame
+        is available, evaluates it, and updates is_speech_active.
+        Returns current is_speech_active state.
+        """
+        self._buffer += audio_bytes
+
+        while len(self._buffer) >= self.FRAME_BYTES:
+            frame = self._buffer[:self.FRAME_BYTES]
+            self._buffer = self._buffer[self.FRAME_BYTES:]
+
+            try:
+                is_frame_speech = self._vad.is_speech(frame, 16000)
+            except Exception:
+                is_frame_speech = False
+
+            if is_frame_speech:
+                self._speech_frames += 1
+                self._silence_frames = 0
+                if self._speech_frames >= self._speech_threshold:
+                    self.is_speech_active = True
+            else:
+                self._silence_frames += 1
+                self._speech_frames = 0
+                if self._silence_frames >= self._silence_threshold:
+                    self.is_speech_active = False
+
+        return self.is_speech_active
+
+    def reset(self):
+        self._buffer = b""
+        self._speech_frames = 0
+        self._silence_frames = 0
+        self.is_speech_active = False
+
+
+class SmartMutingController:
+    """
+    Coordinates cross-direction VAD state to save API cost.
+    - Pauses Direction A when Direction B has active voice.
+    - When disabled, only Direction A's own VAD applies.
+    Thread-safe.
+    """
+
+    def __init__(self):
+        self.enabled = True
+        self._dir_b_active = False
+        self._lock = threading.Lock()
+
+    def set_enabled(self, enabled: bool):
+        with self._lock:
+            self.enabled = enabled
+
+    def update_direction_b(self, is_speech: bool):
+        with self._lock:
+            self._dir_b_active = is_speech
+
+    def should_send_direction_a(self, dir_a_has_speech: bool) -> bool:
+        with self._lock:
+            if not self.enabled:
+                return dir_a_has_speech
+            if self._dir_b_active:
+                return False
+            return dir_a_has_speech
+
+
+# ---------------------------------------------------------------------------
 # Device recovery helper
 # ---------------------------------------------------------------------------
 
 def _recover_device(role_name: str, kind: str, desired_sr: int,
                     channels: int, blocksize: int | None) -> tuple:
     """Re-resolve a device role and validate sample rate after disconnect."""
-    from devices import ROLES as DEV_ROLES, resolve_by_fingerprint, resolve_by_role, validate_samplerate, ResolvedDevice
-    from config import load_fingerprints, save_fingerprint
-    fps = load_fingerprints()
-    rd = None
-    if fps.get(role_name):
-        rd = resolve_by_fingerprint(fps[role_name])
-    if rd is None:
-        rd = resolve_by_role(DEV_ROLES[role_name])
-        save_fingerprint(role_name, rd.fingerprint)
-    actual_sr = validate_samplerate(rd.index, desired_sr, channels, kind)
-    return rd, actual_sr
+    from config import load_config as _lcfg, get_device_index as _gdi, get_device_rate as _gdr
+    from devices import validate_samplerate
+    cfg = _lcfg()
+    idx = _gdi(cfg, role_name)
+    rate = _gdr(cfg, role_name) if kind == "output" else desired_sr
+    actual_sr = validate_samplerate(idx, rate, channels, kind)
+    # Return a minimal object with .index and .name for compatibility
+    import sounddevice as sd
+    d = sd.query_devices()[idx]
+    class _RD: index = idx; name = d["name"]
+    return _RD(), actual_sr
 
 
 # ---------------------------------------------------------------------------
@@ -512,14 +606,20 @@ class GeminiSession:
         pause_event: asyncio.Event | None = None,
         on_transcription: "callable | None" = None,
         on_direction_status: "callable | None" = None,
+        vad: "VoiceActivityDetector | None" = None,
+        smart_muting: "SmartMutingController | None" = None,
+        is_direction_a: bool = True,
     ):
         self.api_key = api_key
         self.target_language = target_language
         self.label = label or target_language
         self.client = genai.Client(api_key=api_key)
-        self._on_transcription = on_transcription  # (role, text) -> None
-        self._on_direction_status = on_direction_status  # (status: str) -> None
+        self._on_transcription = on_transcription
+        self._on_direction_status = on_direction_status
         self._max_retries = 10
+        self._vad = vad
+        self._smart_muting = smart_muting
+        self._is_direction_a = is_direction_a
 
         # Pause support
         self._pause_event = pause_event or asyncio.Event()
@@ -582,14 +682,30 @@ class GeminiSession:
                         while True:
                             await self._pause_event.wait()
                             chunk = await input_queue.get()
-                            await session.send_realtime_input(
-                                audio=types.Blob(
-                                    data=chunk,
-                                    mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}",
+
+                            # VAD filtering — skip silence chunks to save API cost
+                            should_send = True
+                            if self._vad:
+                                has_speech = self._vad.process_chunk(chunk)
+                                if self._smart_muting:
+                                    if self._is_direction_a:
+                                        should_send = self._smart_muting.should_send_direction_a(has_speech)
+                                    else:
+                                        # Direction B: update controller about B's voice state
+                                        self._smart_muting.update_direction_b(has_speech)
+                                        should_send = has_speech  # B sends only when voice detected
+                                else:
+                                    should_send = has_speech
+
+                            if should_send:
+                                await session.send_realtime_input(
+                                    audio=types.Blob(
+                                        data=chunk,
+                                        mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}",
+                                    )
                                 )
-                            )
-                            self.bytes_sent += len(chunk)
-                            self._last_audio_sent = time.time()
+                                self.bytes_sent += len(chunk)
+                                self._last_audio_sent = time.time()
                             input_queue.task_done()
                     except asyncio.CancelledError:
                         pass
@@ -829,27 +945,20 @@ async def run_engine(
     """
     cb = callbacks or {}
 
-    # ---------- preflight + device resolution ----------
-    from preflight import run_preflight
-    from config import load_fingerprints, save_fingerprint
-
-    fps = load_fingerprints()
-    pf = run_preflight(api_key, fps)
-    if not pf.ok:
-        for err in pf.errors:
-            log.error("Preflight: %s", err)
-        raise RuntimeError(f"Preflight failed: {pf.errors}")
-
-    resolved = pf.devices_resolved
-    for role_name, rd in resolved.items():
-        if rd is not None:
-            save_fingerprint(role_name, rd.fingerprint)
-
-    def _get_resolved(name: str) -> ResolvedDevice | None:
-        from devices import ResolvedDevice
-        return resolved.get(name)
+    # ---------- device resolution from config ----------
+    from config import load_config as _lc, get_device_index, get_device_rate
+    _cfg = _lc()
 
     # ---------- helper: build a pipeline ----------
+    smart_muting = SmartMutingController()
+    # Read config for smart muting preference
+    try:
+        from config import load_config as _lc
+        _cfg = _lc()
+        smart_muting.set_enabled(_cfg.get("smart_muting_enabled", True))
+    except Exception:
+        pass
+
     def _build(
         tag: str,
         capture_idx: int,
@@ -863,26 +972,30 @@ async def run_engine(
         on_v: "callable | None" = None,
         player_rate: int = OUTPUT_SAMPLE_RATE,
         player_resample: "callable[[bytes], bytes] | None" = None,
+        is_a: bool = True,
     ) -> TranslationPipeline:
-        # Map role → direction for status callbacks
-        dir_map = {"mic": "A", "virtual_mic_out": "A", "loopback_in": "B", "headphones_out": "B"}
+        dir_map = {"mic": "A", "vbcable": "A", "loopback": "B", "headphones": "B"}
         on_ds = cb.get("on_ds")
         cap_dir = dir_map.get(cap_role, "?")
         plr_dir = dir_map.get(plr_role, "?")
 
-        def _cap_status(st): 
+        def _cap_status(st):
             if on_ds: on_ds(cap_dir, st)
         def _plr_status(st):
             if on_ds: on_ds(plr_dir, st)
 
         pause_evt = asyncio.Event()
         pause_evt.set()
+
+        # VAD per direction
+        vad = VoiceActivityDetector(aggressiveness=2 if is_a else 1)
         cap = AudioCapture(capture_idx, INPUT_SAMPLE_RATE, INPUT_CHUNK_SAMPLES,
                            name=cap_name, pause_event=pause_evt, on_volume=on_v,
                            role_name=cap_role, on_status=_cap_status)
         ses = GeminiSession(api_key=api_key, target_language=target_lang,
                             label=tag, pause_event=pause_evt, on_transcription=on_t,
-                            on_direction_status=cb.get("on_ds"))
+                            on_direction_status=cb.get("on_ds"),
+                            vad=vad, smart_muting=smart_muting, is_direction_a=is_a)
         plr = AudioPlayer(player_idx, player_rate, name=plr_name,
                            resample_fn=player_resample,
                            role_name=plr_role, on_status=_plr_status)
@@ -910,38 +1023,29 @@ async def run_engine(
     # ---------- pipeline lifecycle ----------
     async def start_pipelines():
         nonlocal direction_start
-        mic_rd = _get_resolved("mic")
-        vm_rd  = _get_resolved("virtual_mic_out")
-        lb_rd  = _get_resolved("loopback_in")
-        hp_rd  = _get_resolved("headphones_out")
+        mic_i = get_device_index(_cfg, "mic")
+        vm_i  = get_device_index(_cfg, "vbcable")
+        lb_i  = get_device_index(_cfg, "loopback")
+        hp_i  = get_device_index(_cfg, "headphones")
+        hp_sr = get_device_rate(_cfg, "headphones")
 
-        # Validate sample rates
-        mic_sr = INPUT_SAMPLE_RATE
-        if mic_rd:
-            mic_sr = validate_samplerate(mic_rd.index, INPUT_SAMPLE_RATE, CHANNELS, "input")
-        hp_sr = 48000  # headphone target (we resample 24k->48k)
-        if hp_rd:
-            hp_sr = validate_samplerate(hp_rd.index, 48000, CHANNELS, "output")
-
-        if mic_rd is not None and vm_rd is not None:
-            p = _build("A(es->en)", mic_rd.index, "en", vm_rd.index, "Mic", "VB-Cable",
-                       cap_role="mic", plr_role="virtual_mic_out",
-                       on_t=cb.get("on_t_A"), on_v=cb.get("on_v_A"))
+        if mic_i is not None and vm_i is not None:
+            p = _build("A(es->en)", mic_i, "en", vm_i, "Mic", "VB-Cable",
+                       cap_role="mic", plr_role="vbcable",
+                       on_t=cb.get("on_t_A"), on_v=cb.get("on_v_A"), is_a=True)
             pipelines["A"] = p
-            log.info("Direction A ready: %s[%d] -> Gemini(en) -> %s[%d] @%d Hz",
-                     mic_rd.host_api, mic_rd.index, vm_rd.host_api, vm_rd.index, mic_sr)
-        if lb_rd is not None and hp_rd is not None:
+            log.info("Direction A ready: Mic[%d] -> Gemini(en) -> VB-Cable[%d]", mic_i, vm_i)
+        if lb_i is not None and hp_i is not None:
             need_resample = hp_sr != OUTPUT_SAMPLE_RATE
-            p = _build("B(en->es)", lb_rd.index, "es", hp_rd.index, "Loopback", "Phones",
-                       cap_role="loopback_in", plr_role="headphones_out",
+            p = _build("B(en->es)", lb_i, "es", hp_i, "Loopback", "Phones",
+                       cap_role="loopback", plr_role="headphones",
                        on_t=cb.get("on_t_B"), on_v=cb.get("on_v_B"),
                        player_rate=hp_sr,
-                       player_resample=resample_24k_to_48k if need_resample else None)
+                       player_resample=resample_24k_to_48k if need_resample else None,
+                       is_a=False)
             pipelines["B"] = p
-            log.info("Direction B ready: %s[%d] -> Gemini(es) -> %s[%d] @%d Hz%s",
-                     lb_rd.host_api, lb_rd.index,
-                     hp_rd.host_api, hp_rd.index, hp_sr,
-                     " (resampled)" if need_resample else "")
+            log.info("Direction B ready: B1[%d] -> Gemini(es) -> Phones[%d] @ %d Hz",
+                      lb_i, hp_i, hp_sr)
 
         if not pipelines:
             log.error("No pipelines could be created.")

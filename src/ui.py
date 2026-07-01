@@ -35,7 +35,7 @@ from main import (
     setup_logging,
     log,
 )
-from config import load_config, save_config, load_fingerprints, save_fingerprint
+from config import load_config, save_config
 from devices import ROLES, list_all_devices, resolve_by_role, resolve_by_fingerprint, validate_samplerate
 from windows_audio import get_windows_defaults, open_sound_settings_playback, open_sound_settings_recording
 
@@ -290,6 +290,38 @@ class TranslatorUI:
         if self._state == State.RUNNING: self.state_machine.set_state(State.PAUSED)
         elif self._state == State.PAUSED: self.state_machine.set_state(State.RUNNING)
 
+    def _build_smart_muting_toggle(self):
+        frame = tk.Frame(self.root, bg=SURFACE)
+        frame.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        cfg = load_config()
+        self.smart_muting_var = tk.BooleanVar(value=cfg.get("smart_muting_enabled", True))
+        toggle = tk.Checkbutton(
+            frame, text="\u26a1 Smart Muting",
+            variable=self.smart_muting_var,
+            command=self._on_smart_muting_toggle,
+            bg=SURFACE, fg=TEXT, selectcolor=SURFACE,
+            activebackground=SURFACE, activeforeground=ACCENT,
+            font=tkfont.Font(family="Consolas", size=9), cursor="hand2",
+        )
+        toggle.pack(side=tk.LEFT)
+        Tooltip(toggle,
+            "Pausa tu voz mientras el entrevistador habla.\n"
+            "Reduce costo de API ~50%. Desactivar si hay problemas.")
+
+        self.muting_status_label = tk.Label(
+            frame, text="", bg=SURFACE, fg=MUTED,
+            font=tkfont.Font(family="Consolas", size=8),
+        )
+        self.muting_status_label.pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _on_smart_muting_toggle(self):
+        enabled = self.smart_muting_var.get()
+        cfg = load_config()
+        cfg["smart_muting_enabled"] = enabled
+        save_config(cfg)
+        log.info("Smart Muting: %s", "ON" if enabled else "OFF")
+
     # ------------------------------------------------------------------
     # Refresh loop
     # ------------------------------------------------------------------
@@ -428,6 +460,9 @@ class TranslatorUI:
         self._btn_pause.bind("<Button-1>", lambda e: self._on_pause())
         Tooltip(self._btn_pause, "Pausa la traducci\u00f3n sin cortar la conexi\u00f3n con Gemini.")
 
+        # Smart Muting toggle
+        self._build_smart_muting_toggle()
+
         # ==== DIRECTIONS ====
         self._build_direction("A", "Mic  (es \u2192 en)", True)
         self._build_direction("B", "Sys  (en \u2192 es)", False)
@@ -558,21 +593,26 @@ class TranslatorUI:
 
         labels = []
         for d in filtered:
+            short_api = d["host_api"].replace("Windows ", "")[:6]
+            lbl = "[{:3d}] {:6s} \u2014 {}".format(d["index"], short_api, d["name"])
             fp = "{}||{}||{}||{}||{}".format(
                 d["host_api"], d["name"],
                 d["max_input_channels"], d["max_output_channels"],
                 d["default_samplerate"])
-            labels.append(("[{}] {}".format(d["host_api"], d["name"]), fp))
+            labels.append((lbl, fp))
         self._device_options[role_name] = labels
 
-        # Preselect by fingerprint
-        fps = load_fingerprints()
-        fp_saved = fps.get(role_name)
+        # Preselect from config
+        cfg = load_config()
+        saved_dev = cfg.get("devices", {}).get(role_name, {})
+        saved_idx = saved_dev.get("index", -1)
         selected = False
-        if fp_saved:
+        if saved_idx >= 0:
             for lbl, fp in labels:
-                if fp == fp_saved:
-                    combo.set(lbl); selected = True; break
+                if str(saved_idx) in lbl.split("]")[0]:
+                    combo.set(lbl)
+                    selected = True
+                    break
         if not selected:
             try:
                 rd = resolve_by_role(role)
@@ -597,12 +637,26 @@ class TranslatorUI:
         _on_select()
 
     def _apply_devices(self):
+        cfg = load_config()
         for role_name, combo in self._device_combos.items():
             val = combo.get()
-            for lbl, fp in self._device_options.get(role_name, []):
-                if lbl == val:
-                    save_fingerprint(role_name, fp)
+            for lbl in self._device_options.get(role_name, []):
+                label_str = lbl[0] if isinstance(lbl, tuple) else lbl
+                if label_str == val:
+                    # Parse "[ 13] MME    — Altavoces..." -> index + name + hostapi
+                    parts = label_str.split("\u2014", 1)
+                    header = parts[0].strip()  # "[ 13] MME   "
+                    name = parts[1].strip() if len(parts) > 1 else ""
+                    idx_str = header.split("]")[0].replace("[", "").strip()
+                    hostapi = header.split("]")[1].strip()
+                    idx = int(idx_str)
+                    # Get rate from sounddevice
+                    import sounddevice as sd
+                    rate = int(sd.query_devices()[idx]["default_samplerate"])
+                    cfg["devices"][role_name] = {"index": idx, "name": name,
+                                                  "hostapi": hostapi, "rate": rate}
                     break
+        save_config(cfg)
         if self._state in (State.RUNNING, State.PAUSED):
             self.state_machine.set_state(State.STOPPED)
             self.root.after(800, lambda: self.state_machine.set_state(State.RUNNING))
@@ -730,12 +784,11 @@ class TranslatorUI:
 
             # 3. Devices
             try:
-                fps = load_fingerprints()
-                for rn, role in DEV_ROLES.items():
-                    fp = fps.get(rn)
-                    rd = resolve_by_fingerprint(fp) if fp else None
-                    if rd is None:
-                        rd = dev_resolve(role)
+                cfg = load_config()
+                for rn in DEV_ROLES:
+                    idx = cfg.get("devices", {}).get(rn, {}).get("index", -1)
+                    if idx < 0:
+                        raise Exception("Device '{}' not configured".format(rn))
                 modal.after(0, lambda: _set_check("devices", True))
             except Exception as e:
                 modal.after(0, lambda: _set_check("devices", False, str(e)[:200]))
@@ -780,7 +833,8 @@ class TranslatorUI:
                     sd.play((full * 32767).astype(np.int16), samplerate=sr, device=rd.index, blocking=True)
                     modal.after(0, lambda: _ask_audio_result(rd.index, sr))
                 except Exception as e:
-                    modal.after(0, lambda: _set_check("audio", False, str(e)[:200]))
+                    _err = str(e)[:200]
+                    modal.after(0, lambda err=_err: _set_check("audio", False, err))
 
             threading.Thread(target=_audio_test, daemon=True).start()
 
